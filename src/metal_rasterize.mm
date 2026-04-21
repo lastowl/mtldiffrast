@@ -73,12 +73,12 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
     auto pos_c = pos.contiguous().to(torch::kFloat32);
     auto tri_c = tri.contiguous().to(torch::kInt32);
 
-    // Create output tensors
+    // Output tensors follow the input's device. On MPS they're MPS-backed
+    // via _safe_zeros_on_device; render-pipeline writes reach them through a
+    // blit encoder below (no more MTLTexture getBytes, no CPU round-trip).
+    bool on_mps = tensor_is_mps(pos);
     auto rast_out = make_output_tensor({H, W, 4}, torch::kFloat32, pos);
-    auto rast_db = make_output_tensor({H, W, 4}, torch::kFloat32, pos);
-
-    // Sync MPS before Metal dispatch
-    if (any_tensor_on_mps(pos, tri)) mps_sync();
+    auto rast_db  = make_output_tensor({H, W, 4}, torch::kFloat32, pos);
 
     auto pos_ref = tensor_to_mtl_buffer(pos_c);
     auto tri_ref = tensor_to_mtl_buffer(tri_c);
@@ -87,7 +87,12 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
 
     if (render_pipeline_) {
         // ─── Hardware render pipeline path ───────────────────────────
-        // Single draw call for ALL triangles — no chunking, hardware depth test.
+        // One cmdBuf owns three encoders in order:
+        //   1) render encoder → draws into colorTex (Shared storage),
+        //   2) blit encoder   → copies colorTex → out_ref.buffer (rast_out),
+        //   3) compute encoder → reads rast_out, writes rast_db derivatives.
+        // On MPS the whole sequence encodes into the active MPSStream; on CPU
+        // dispatch_batch commits+waits so the tensor data is valid on return.
 
         // Create standalone shared render target texture
         MTLTextureDescriptor* colorTexDesc = [MTLTextureDescriptor
@@ -117,78 +122,74 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
         rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
         rpd.depthAttachment.clearDepth = 0.0;  // All valid z/w >= 0 will pass GreaterEqual
 
-        id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-        id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+        struct {
+            int num_triangles;
+            int num_vertices;
+            int width;
+            int height;
+            float xs, xo, ys, yo;
+            int chunk_start;
+        } db_params;
+        db_params.num_triangles = num_triangles;
+        db_params.num_vertices = num_vertices;
+        db_params.width = W;
+        db_params.height = H;
+        db_params.xs = 2.0f / (float)W;
+        db_params.xo = -1.0f + 1.0f / (float)W;
+        db_params.ys = 2.0f / (float)H;
+        db_params.yo = -1.0f + 1.0f / (float)H;
+        db_params.chunk_start = 0;
 
-        [enc setRenderPipelineState:render_pipeline_];
-        [enc setDepthStencilState:depth_stencil_];
-        [enc setFrontFacingWinding:MTLWindingCounterClockwise];
-        [enc setCullMode:MTLCullModeNone];  // No culling — match compute kernel behavior
-
-        // Set viewport to match pixel grid
-        // Flip Y to match compute kernel convention (Y=0 at bottom)
-        MTLViewport viewport = {0.0, (double)H, (double)W, -(double)H, 0.0, 1.0};
-        [enc setViewport:viewport];
-
-        // Vertex shader buffers: positions + triangles + num_vertices
-        [enc setVertexBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
-        [enc setVertexBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
+        auto db_pso = mtl_get_pipeline("rasterize_db_kernel");
+        auto render_pso = render_pipeline_;
+        auto depth_state = depth_stencil_;
         int nverts = num_vertices;
-        [enc setVertexBytes:&nverts length:sizeof(int) atIndex:2];
-
-        // Single draw call: num_triangles * 3 vertices
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle
-                vertexStart:0
-                vertexCount:num_triangles * 3];
-
-        [enc endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-
-        // Copy render target back to output tensor
         NSUInteger bytesPerRow = W * 4 * sizeof(float);
-        [colorTex getBytes:rast_out.data_ptr()
-               bytesPerRow:bytesPerRow
-                fromRegion:MTLRegionMake2D(0, 0, W, H)
-               mipmapLevel:0];
 
-        // Compute bary derivatives in a second pass
-        {
-            struct {
-                int num_triangles;
-                int num_vertices;
-                int width;
-                int height;
-                float xs, xo, ys, yo;
-                int chunk_start;
-            } db_params;
-            db_params.num_triangles = num_triangles;
-            db_params.num_vertices = num_vertices;
-            db_params.width = W;
-            db_params.height = H;
-            db_params.xs = 2.0f / (float)W;
-            db_params.xo = -1.0f + 1.0f / (float)W;
-            db_params.ys = 2.0f / (float)H;
-            db_params.yo = -1.0f + 1.0f / (float)H;
-            db_params.chunk_start = 0;
+        dispatch_batch(on_mps, ^(id<MTLCommandBuffer> cmdBuf) {
+            // (1) render encoder
+            id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+            [enc setRenderPipelineState:render_pso];
+            [enc setDepthStencilState:depth_state];
+            [enc setFrontFacingWinding:MTLWindingCounterClockwise];
+            [enc setCullMode:MTLCullModeNone];
+            // Flip Y to match compute kernel convention (Y=0 at bottom)
+            MTLViewport viewport = {0.0, (double)H, (double)W, -(double)H, 0.0, 1.0};
+            [enc setViewport:viewport];
+            [enc setVertexBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
+            [enc setVertexBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
+            [enc setVertexBytes:&nverts length:sizeof(int) atIndex:2];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                    vertexStart:0
+                    vertexCount:num_triangles * 3];
+            [enc endEncoding];
 
-            auto db_pso = mtl_get_pipeline("rasterize_db_kernel");
-            // Re-get out_ref since tensor may have been updated by getBytes
-            auto out_ref2 = tensor_to_mtl_buffer(rast_out);
+            // (2) blit: colorTex -> rast_out buffer. Metal guarantees
+            // encoder ordering within a cmdBuf, so the compute pass below
+            // sees the blit's writes to the rast_out buffer.
+            id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+            [blit copyFromTexture:colorTex
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(W, H, 1)
+                         toBuffer:out_ref.buffer
+                destinationOffset:out_ref.offset
+           destinationBytesPerRow:bytesPerRow
+         destinationBytesPerImage:bytesPerRow * H];
+            [blit endEncoding];
 
-            id<MTLCommandBuffer> dbCmd = [queue_ commandBuffer];
-            id<MTLComputeCommandEncoder> dbEnc = [dbCmd computeCommandEncoder];
+            // (3) compute: rast_db derivatives from rast_out and pos/tri
+            id<MTLComputeCommandEncoder> dbEnc = [cmdBuf computeCommandEncoder];
             [dbEnc setComputePipelineState:db_pso];
             [dbEnc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
             [dbEnc setBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
             [dbEnc setBytes:&db_params length:sizeof(db_params) atIndex:2];
-            [dbEnc setBuffer:out_ref2.buffer offset:out_ref2.offset atIndex:3];
+            [dbEnc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
             [dbEnc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
             [dbEnc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
             [dbEnc endEncoding];
-            [dbCmd commit];
-            [dbCmd waitUntilCompleted];
-        }
+        });
 
     } else {
         // ─── Compute kernel fallback ─────────────────────────────────
@@ -210,22 +211,21 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
         params.yo = -1.0f + 1.0f / (float)H;
 
         const int CHUNK_SIZE = 100000;
+        auto compute_pso = compute_pipeline_;
 
         if (num_triangles <= CHUNK_SIZE) {
             params.num_triangles = num_triangles;
             params.chunk_start = 0;
-            id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-            [enc setComputePipelineState:compute_pipeline_];
-            [enc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
-            [enc setBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
-            [enc setBytes:&params length:sizeof(params) atIndex:2];
-            [enc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
-            [enc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
-            [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-            [enc endEncoding];
-            [cmdBuf commit];
-            [cmdBuf waitUntilCompleted];
+            dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+                (void)cmdBuf;
+                [enc setComputePipelineState:compute_pso];
+                [enc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
+                [enc setBuffer:tri_ref.buffer offset:tri_ref.offset atIndex:1];
+                [enc setBytes:&params length:sizeof(params) atIndex:2];
+                [enc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
+                [enc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
+                [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            });
         } else {
             for (int chunk_start = 0; chunk_start < num_triangles; chunk_start += CHUNK_SIZE) {
                 int chunk_end = std::min(chunk_start + CHUNK_SIZE, num_triangles);
@@ -234,18 +234,16 @@ std::tuple<torch::Tensor, torch::Tensor> MtlRasterizeContext::rasterize(
 
                 NSUInteger tri_byte_offset = tri_ref.offset + chunk_start * 3 * sizeof(int);
 
-                id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-                id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-                [enc setComputePipelineState:compute_pipeline_];
-                [enc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
-                [enc setBuffer:tri_ref.buffer offset:tri_byte_offset atIndex:1];
-                [enc setBytes:&params length:sizeof(params) atIndex:2];
-                [enc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
-                [enc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
-                [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-                [enc endEncoding];
-                [cmdBuf commit];
-                [cmdBuf waitUntilCompleted];
+                dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+                    (void)cmdBuf;
+                    [enc setComputePipelineState:compute_pso];
+                    [enc setBuffer:pos_ref.buffer offset:pos_ref.offset atIndex:0];
+                    [enc setBuffer:tri_ref.buffer offset:tri_byte_offset atIndex:1];
+                    [enc setBytes:&params length:sizeof(params) atIndex:2];
+                    [enc setBuffer:out_ref.buffer offset:out_ref.offset atIndex:3];
+                    [enc setBuffer:db_ref.buffer offset:db_ref.offset atIndex:4];
+                    [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                });
             }
         }
     }
@@ -295,7 +293,7 @@ torch::Tensor MtlRasterizeContext::rasterize_grad(
     params.yo = -1.0f + 1.0f / (float)H;
     params.enable_db = enable_db ? 1 : 0;
 
-    if (any_tensor_on_mps(pos, tri, rast_out, dy)) mps_sync();
+    // No mps_sync: dispatch_kernel on MPS encodes into the active MPSStream.
 
     auto pos_ref = tensor_to_mtl_buffer(pos_c);
     auto tri_ref = tensor_to_mtl_buffer(tri_c);
@@ -306,20 +304,19 @@ torch::Tensor MtlRasterizeContext::rasterize_grad(
 
     auto pso = mtl_get_pipeline("rasterize_grad_kernel");
 
-    id<MTLCommandBuffer> cmdBuf = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:pos_ref.buffer  offset:pos_ref.offset  atIndex:0];
-    [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:1];
-    [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
-    [enc setBuffer:dy_ref.buffer   offset:dy_ref.offset   atIndex:3];
-    [enc setBuffer:ddb_ref.buffer  offset:ddb_ref.offset  atIndex:4];
-    [enc setBuffer:grad_ref.buffer offset:grad_ref.offset atIndex:5];
-    [enc setBytes:&params length:sizeof(params) atIndex:6];
-    [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    bool on_mps = tensor_is_mps(pos);
+    dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+        (void)cmdBuf;
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:pos_ref.buffer  offset:pos_ref.offset  atIndex:0];
+        [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:1];
+        [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
+        [enc setBuffer:dy_ref.buffer   offset:dy_ref.offset   atIndex:3];
+        [enc setBuffer:ddb_ref.buffer  offset:ddb_ref.offset  atIndex:4];
+        [enc setBuffer:grad_ref.buffer offset:grad_ref.offset atIndex:5];
+        [enc setBytes:&params length:sizeof(params) atIndex:6];
+        [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    });
 
     return grad_pos;
 }

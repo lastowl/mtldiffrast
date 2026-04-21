@@ -157,25 +157,25 @@ std::tuple<torch::Tensor, torch::Tensor> antialias_fwd(
         int workCount = work_buffer.data_ptr<int>()[0];
         if (workCount > 0)
         {
+            bool on_mps = out.device().is_mps();
             auto pso = mtl_get_pipeline("AntialiasFwdAnalysisKernel");
-            id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-            [enc setComputePipelineState:pso];
-            [enc setBuffer:color_ref.buffer offset:color_ref.offset atIndex:0];
-            [enc setBuffer:rast_ref.buffer  offset:rast_ref.offset  atIndex:1];
-            [enc setBuffer:tri_ref.buffer   offset:tri_ref.offset   atIndex:2];
-            [enc setBuffer:pos_ref.buffer   offset:pos_ref.offset   atIndex:3];
-            [enc setBuffer:out_ref.buffer   offset:out_ref.offset   atIndex:4];
-            [enc setBuffer:work_ref.buffer  offset:work_ref.offset  atIndex:5];
-            [enc setBuffer:hash_ref.buffer  offset:hash_ref.offset  atIndex:6];
-            [enc setBytes:&p length:sizeof(p) atIndex:7];
+            dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+                (void)cmdBuf;
+                [enc setComputePipelineState:pso];
+                [enc setBuffer:color_ref.buffer offset:color_ref.offset atIndex:0];
+                [enc setBuffer:rast_ref.buffer  offset:rast_ref.offset  atIndex:1];
+                [enc setBuffer:tri_ref.buffer   offset:tri_ref.offset   atIndex:2];
+                [enc setBuffer:pos_ref.buffer   offset:pos_ref.offset   atIndex:3];
+                [enc setBuffer:out_ref.buffer   offset:out_ref.offset   atIndex:4];
+                [enc setBuffer:work_ref.buffer  offset:work_ref.offset  atIndex:5];
+                [enc setBuffer:hash_ref.buffer  offset:hash_ref.offset  atIndex:6];
+                [enc setBytes:&p length:sizeof(p) atIndex:7];
 
-            NSUInteger threadGroupSize = MIN((NSUInteger)AA_ANALYSIS_KERNEL_THREADS_PER_BLOCK, pso.maxTotalThreadsPerThreadgroup);
-            [enc dispatchThreads:MTLSizeMake((NSUInteger)workCount, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
-            [enc endEncoding];
-            [cmdBuf commit];
-            [cmdBuf waitUntilCompleted];
+                NSUInteger threadGroupSize = MIN((NSUInteger)AA_ANALYSIS_KERNEL_THREADS_PER_BLOCK,
+                                                 pso.maxTotalThreadsPerThreadgroup);
+                [enc dispatchThreads:MTLSizeMake((NSUInteger)workCount, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
+            });
         }
     }
 
@@ -237,27 +237,26 @@ std::tuple<torch::Tensor, torch::Tensor> antialias_grad(
     auto gp_ref = tensor_to_mtl_buffer(grad_pos);
     auto work_ref = tensor_to_mtl_buffer(work_c);
 
+    bool on_mps = grad_color.device().is_mps();
     auto pso = mtl_get_pipeline("AntialiasGradKernel");
-    auto queue = mtl_get_queue();
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:color_ref.buffer offset:color_ref.offset atIndex:0];
-    [enc setBuffer:rast_ref.buffer  offset:rast_ref.offset  atIndex:1];
-    [enc setBuffer:tri_ref.buffer   offset:tri_ref.offset   atIndex:2];
-    [enc setBuffer:pos_ref.buffer   offset:pos_ref.offset   atIndex:3];
-    [enc setBuffer:dy_ref.buffer    offset:dy_ref.offset    atIndex:4];
-    [enc setBuffer:gc_ref.buffer    offset:gc_ref.offset    atIndex:5];
-    [enc setBuffer:gp_ref.buffer    offset:gp_ref.offset    atIndex:6];
-    [enc setBuffer:work_ref.buffer  offset:work_ref.offset  atIndex:7];
-    [enc setBytes:&p length:sizeof(p) atIndex:8];
+    dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+        (void)cmdBuf;
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:color_ref.buffer offset:color_ref.offset atIndex:0];
+        [enc setBuffer:rast_ref.buffer  offset:rast_ref.offset  atIndex:1];
+        [enc setBuffer:tri_ref.buffer   offset:tri_ref.offset   atIndex:2];
+        [enc setBuffer:pos_ref.buffer   offset:pos_ref.offset   atIndex:3];
+        [enc setBuffer:dy_ref.buffer    offset:dy_ref.offset    atIndex:4];
+        [enc setBuffer:gc_ref.buffer    offset:gc_ref.offset    atIndex:5];
+        [enc setBuffer:gp_ref.buffer    offset:gp_ref.offset    atIndex:6];
+        [enc setBuffer:work_ref.buffer  offset:work_ref.offset  atIndex:7];
+        [enc setBytes:&p length:sizeof(p) atIndex:8];
 
-    NSUInteger threadGroupSize = MIN((NSUInteger)AA_GRAD_KERNEL_THREADS_PER_BLOCK, pso.maxTotalThreadsPerThreadgroup);
-    [enc dispatchThreads:MTLSizeMake((NSUInteger)workCount, 1, 1)
-   threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+        NSUInteger threadGroupSize = MIN((NSUInteger)AA_GRAD_KERNEL_THREADS_PER_BLOCK,
+                                         pso.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)workCount, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threadGroupSize, 1, 1)];
+    });
 
     return {grad_color, grad_pos};
 }

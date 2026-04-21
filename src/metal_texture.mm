@@ -101,7 +101,9 @@ TextureMipWrapper texture_construct_mip(const torch::Tensor& tex, int max_mip_le
     }
 
     int boundaryMode = cube_mode ? TEX_BOUNDARY_MODE_CUBE : TEX_BOUNDARY_MODE_WRAP;
-    int mipOffsets[TEX_MAX_MIP_LEVEL];
+    // Heap-allocated so the dispatch_batch block can capture the pointer.
+    std::vector<int> mipOffsetsVec(TEX_MAX_MIP_LEVEL, 0);
+    int* mipOffsets = mipOffsetsVec.data();
     int mipLevelMax = 0;
     int mipTotal = calculateMipInfo(texWidth, texHeight, texDepth, channels,
                                      boundaryMode, max_mip_level, mipOffsets, mipLevelMax);
@@ -119,6 +121,12 @@ TextureMipWrapper texture_construct_mip(const torch::Tensor& tex, int max_mip_le
 
     auto texFlat = tex.contiguous().view({-1});
 
+    // mip is CPU-allocated (torch::empty without device), and texFlat shares
+    // storage with `tex`. If `tex` is MPS the caller is expected to stage to
+    // CPU beforehand — mip construction is setup-time CPU work. dispatch_batch
+    // with on_mps=false wraps the entire mip-build chain in a single cmdBuf
+    // while keeping the endKernelCoalescing + autorelease pattern consistent
+    // with the rest of the file.
     id<MTLBuffer> mipBuf = [dev newBufferWithBytesNoCopy:mip.data_ptr<float>()
                                                   length:mipTotal * sizeof(float)
                                                  options:MTLResourceStorageModeShared
@@ -129,50 +137,49 @@ TextureMipWrapper texture_construct_mip(const torch::Tensor& tex, int max_mip_le
                                                  options:MTLResourceStorageModeShared
                                              deallocator:nil];
 
-    // Batch all mip levels into a single command buffer
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    for (int i = 1; i <= mipLevelMax; i++)
-    {
-        auto ms = mipLevelSizeCPU(texWidth, texHeight, i);
-        int outW = ms.x;
-        int outH = ms.y;
-        int depth = texDepth * (cube_mode ? 6 : 1);
+    (void)queue;
+    dispatch_batch(/*on_mps=*/false, ^(id<MTLCommandBuffer> cmdBuf) {
+        for (int i = 1; i <= mipLevelMax; i++)
+        {
+            auto ms = mipLevelSizeCPU(texWidth, texHeight, i);
+            int outW = ms.x;
+            int outH = ms.y;
+            int depth = texDepth * (cube_mode ? 6 : 1);
 
-        TextureKernelParams kp = {};
-        kp.channels = channels;
-        kp.texWidth = texWidth;
-        kp.texHeight = texHeight;
-        kp.mipLevelOut = i;
+            TextureKernelParams kp = {};
+            kp.channels = channels;
+            kp.texWidth = texWidth;
+            kp.texHeight = texHeight;
+            kp.mipLevelOut = i;
 
-        id<MTLBuffer> inBuf;
-        int inOffset = 0;
-        if (i == 1) {
-            inBuf = texBuf;
-            inOffset = 0;
-        } else {
-            inBuf = mipBuf;
-            inOffset = mipOffsets[i - 1] * sizeof(float);
+            id<MTLBuffer> inBuf;
+            int inOffset = 0;
+            if (i == 1) {
+                inBuf = texBuf;
+                inOffset = 0;
+            } else {
+                inBuf = mipBuf;
+                inOffset = mipOffsets[i - 1] * sizeof(float);
+            }
+
+            int outOffset = mipOffsets[i] * sizeof(float);
+
+            id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:inBuf  offset:inOffset  atIndex:0];
+            [enc setBuffer:mipBuf offset:outOffset atIndex:1];
+            [enc setBytes:&kp length:sizeof(kp) atIndex:2];
+
+            MTLSize gridSize = MTLSizeMake(outW, outH, depth);
+            NSUInteger tw = pipeline.threadExecutionWidth;
+            NSUInteger th = pipeline.maxTotalThreadsPerThreadgroup / tw;
+            if (th > (NSUInteger)outH) th = (NSUInteger)outH;
+            MTLSize threadgroupSize = MTLSizeMake(tw, th, 1);
+
+            [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+            [enc endEncoding];
         }
-
-        int outOffset = mipOffsets[i] * sizeof(float);
-
-        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:inBuf  offset:inOffset  atIndex:0];
-        [enc setBuffer:mipBuf offset:outOffset atIndex:1];
-        [enc setBytes:&kp length:sizeof(kp) atIndex:2];
-
-        MTLSize gridSize = MTLSizeMake(outW, outH, depth);
-        NSUInteger tw = pipeline.threadExecutionWidth;
-        NSUInteger th = pipeline.maxTotalThreadsPerThreadgroup / tw;
-        if (th > (NSUInteger)outH) th = (NSUInteger)outH;
-        MTLSize threadgroupSize = MTLSizeMake(tw, th, 1);
-
-        [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-        [enc endEncoding];
-    }
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    });
 
     TextureMipWrapper wrapper;
     wrapper.mip = mip;
@@ -302,7 +309,9 @@ torch::Tensor texture_fwd_mip(
 
     auto pipeline = mtl_get_pipeline(kernelNames[channelDivIdx]);
 
-    if (any_tensor_on_mps(tex, uv)) mps_sync();
+    // No mps_sync: dispatch_kernel on MPS encodes into the active MPSStream,
+    // which handles ordering with surrounding torch.mps work. CPU path is
+    // synchronous via commit+wait inside dispatch_kernel.
 
     auto tex_ref = tensor_to_mtl_buffer(texCombined);
     auto uvContig = uv.contiguous();
@@ -330,27 +339,24 @@ torch::Tensor texture_fwd_mip(
 
     auto out_ref = tensor_to_mtl_buffer(out);
 
-    auto queue = mtl_get_queue();
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pipeline];
-    [enc setBuffer:tex_ref.buffer     offset:tex_ref.offset     atIndex:0];
-    [enc setBuffer:uv_ref.buffer      offset:uv_ref.offset      atIndex:1];
-    [enc setBuffer:uvda_ref.buffer    offset:uvda_ref.offset    atIndex:2];
-    [enc setBuffer:mipbias_ref.buffer offset:mipbias_ref.offset atIndex:3];
-    [enc setBuffer:out_ref.buffer     offset:out_ref.offset     atIndex:4];
-    [enc setBytes:&kp length:sizeof(kp) atIndex:5];
-
     MTLSize gridSize = MTLSizeMake(imgWidth, imgHeight, n);
     NSUInteger tw = pipeline.threadExecutionWidth;
     NSUInteger th = pipeline.maxTotalThreadsPerThreadgroup / tw;
     if (th > (NSUInteger)imgHeight) th = (NSUInteger)imgHeight;
     MTLSize threadgroupSize = MTLSizeMake(tw, th, 1);
 
-    [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    bool on_mps = tensor_is_mps(tex);
+    dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+        (void)cmdBuf;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:tex_ref.buffer     offset:tex_ref.offset     atIndex:0];
+        [enc setBuffer:uv_ref.buffer      offset:uv_ref.offset      atIndex:1];
+        [enc setBuffer:uvda_ref.buffer    offset:uvda_ref.offset    atIndex:2];
+        [enc setBuffer:mipbias_ref.buffer offset:mipbias_ref.offset atIndex:3];
+        [enc setBuffer:out_ref.buffer     offset:out_ref.offset     atIndex:4];
+        [enc setBytes:&kp length:sizeof(kp) atIndex:5];
+        [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    });
 
     return out;
 }
@@ -472,7 +478,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> texture_g
     else
         gradMipBias = torch::zeros({1}, torch::kFloat32);
 
-    if (any_tensor_on_mps(tex, uv, dy)) mps_sync();
+    // No mps_sync: dispatch_kernel on MPS encodes into the active MPSStream.
 
     auto tex_ref = tensor_to_mtl_buffer(texCombined);
     auto uvContig = uv.contiguous();
@@ -507,48 +513,49 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> texture_g
 
     auto pipeline = mtl_get_pipeline("TextureGradKernel");
 
-    auto queue = mtl_get_queue();
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pipeline];
-    [enc setBuffer:tex_ref.buffer     offset:tex_ref.offset     atIndex:0];
-    [enc setBuffer:uv_ref.buffer      offset:uv_ref.offset      atIndex:1];
-    [enc setBuffer:uvda_ref.buffer    offset:uvda_ref.offset    atIndex:2];
-    [enc setBuffer:mipbias_ref.buffer offset:mipbias_ref.offset atIndex:3];
-    [enc setBuffer:dy_ref.buffer      offset:dy_ref.offset      atIndex:4];
-    [enc setBuffer:gt_ref.buffer      offset:gt_ref.offset      atIndex:5];
-    [enc setBuffer:gu_ref.buffer      offset:gu_ref.offset      atIndex:6];
-    [enc setBuffer:guda_ref.buffer    offset:guda_ref.offset    atIndex:7];
-    [enc setBuffer:gm_ref.buffer      offset:gm_ref.offset      atIndex:8];
-    [enc setBytes:&kp length:sizeof(kp) atIndex:9];
-
     MTLSize gridSize = MTLSizeMake(imgWidth, imgHeight, n);
     NSUInteger tw = pipeline.threadExecutionWidth;
     NSUInteger th = pipeline.maxTotalThreadsPerThreadgroup / tw;
     if (th > (NSUInteger)imgHeight) th = (NSUInteger)imgHeight;
-    [enc dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    MTLSize tgSize = MTLSizeMake(tw, th, 1);
 
-    // Mip grad kernel
+    bool on_mps = tensor_is_mps(tex);
+
+    dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+        (void)cmdBuf;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:tex_ref.buffer     offset:tex_ref.offset     atIndex:0];
+        [enc setBuffer:uv_ref.buffer      offset:uv_ref.offset      atIndex:1];
+        [enc setBuffer:uvda_ref.buffer    offset:uvda_ref.offset    atIndex:2];
+        [enc setBuffer:mipbias_ref.buffer offset:mipbias_ref.offset atIndex:3];
+        [enc setBuffer:dy_ref.buffer      offset:dy_ref.offset      atIndex:4];
+        [enc setBuffer:gt_ref.buffer      offset:gt_ref.offset      atIndex:5];
+        [enc setBuffer:gu_ref.buffer      offset:gu_ref.offset      atIndex:6];
+        [enc setBuffer:guda_ref.buffer    offset:guda_ref.offset    atIndex:7];
+        [enc setBuffer:gm_ref.buffer      offset:gm_ref.offset      atIndex:8];
+        [enc setBytes:&kp length:sizeof(kp) atIndex:9];
+        [enc dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+    });
+
+    // Mip grad kernel — read-modify-write on gradTex; runs after the main
+    // grad kernel (same queue ordering on both MPS and CPU paths).
     if (enableMip && kp.mipLevelMax > 0) {
         auto mipPipeline = mtl_get_pipeline("MipGradKernel");
         int depth = texDepth * (cube_mode ? 6 : 1);
 
-        id<MTLCommandBuffer> cmdBuf2 = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc2 = [cmdBuf2 computeCommandEncoder];
-        [enc2 setComputePipelineState:mipPipeline];
-        [enc2 setBuffer:gt_ref.buffer offset:gt_ref.offset atIndex:0];
-        [enc2 setBytes:&kp length:sizeof(kp) atIndex:1];
         MTLSize mipGrid = MTLSizeMake(texWidth, texHeight, depth);
         NSUInteger mtw = mipPipeline.threadExecutionWidth;
         NSUInteger mth = mipPipeline.maxTotalThreadsPerThreadgroup / mtw;
         if (mth > (NSUInteger)texHeight) mth = (NSUInteger)texHeight;
-        [enc2 dispatchThreads:mipGrid threadsPerThreadgroup:MTLSizeMake(mtw, mth, 1)];
-        [enc2 endEncoding];
-        [cmdBuf2 commit];
-        [cmdBuf2 waitUntilCompleted];
+        MTLSize mipTg = MTLSizeMake(mtw, mth, 1);
+
+        dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+            (void)cmdBuf;
+            [enc setComputePipelineState:mipPipeline];
+            [enc setBuffer:gt_ref.buffer offset:gt_ref.offset atIndex:0];
+            [enc setBytes:&kp length:sizeof(kp) atIndex:1];
+            [enc dispatchThreads:mipGrid threadsPerThreadgroup:mipTg];
+        });
     }
 
     auto gradTexOut = gradTex.slice(0, 0, baseSizeFloats).view(tex.sizes());

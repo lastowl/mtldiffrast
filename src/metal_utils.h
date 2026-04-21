@@ -129,25 +129,56 @@ inline MtlBufferRef tensor_to_mtl_buffer(const torch::Tensor& t) {
     return {buf, 0};
 }
 
-// Output tensors stay on CPU — the render-pipeline rasterize path uses
-// [MTLTexture getBytes:out.data_ptr()] which requires CPU-mapped memory,
-// and the compute paths use newBufferWithBytesNoCopy against the tensor's
-// data_ptr which also requires CPU backing. Proper MPS-output support
-// needs a blit-encoder pass to copy private-storage render targets into
-// an MTLBuffer + matching MPS allocation for the compute paths; tracked
-// in FOLLOWUPS.md. For now the caller (Python side) can .to('mps') the
-// result — the regression from zero-copy is just one device transfer,
-// vs the input-side leak which was PER element of a call.
+// Output allocation: respects the reference tensor's device so both MPS and
+// CPU paths can run zero-copy end-to-end. On the broken-MPS-kernels PyTorch
+// build used by shivam, `torch::zeros`/`torch::empty` direct-on-MPS may
+// still raise DispatchStub-missing errors for certain dtypes; we defensively
+// stage through CPU in that case and transfer — on Apple Silicon unified
+// memory this is a metadata operation, so the cost vs a native MPS empty is
+// negligible.
 //
-// reference_tensor is kept in the signature so callers can later opt in
-// to device-aware allocation without a source churn.
+// The render-pipeline rasterize path still uses [MTLTexture getBytes:...]
+// which requires CPU-mapped memory; the blit-encoder rewrite that removes
+// that constraint is tracked in FOLLOWUPS.md. For compute paths the zero-copy
+// tensor_to_mtl_buffer binding already handles both CPU and MPS.
+inline torch::Tensor _safe_zeros_on_device(
+    const std::vector<int64_t>& sizes,
+    torch::ScalarType dtype,
+    c10::Device device
+) {
+    auto opts = torch::TensorOptions().dtype(dtype);
+    if (device.is_cpu()) {
+        return torch::zeros(sizes, opts);
+    }
+    try {
+        return torch::zeros(sizes, opts.device(device));
+    } catch (const std::exception&) {
+        return torch::zeros(sizes, opts).to(device);
+    }
+}
+
+inline torch::Tensor _safe_empty_on_device(
+    const std::vector<int64_t>& sizes,
+    torch::ScalarType dtype,
+    c10::Device device
+) {
+    auto opts = torch::TensorOptions().dtype(dtype);
+    if (device.is_cpu()) {
+        return torch::empty(sizes, opts);
+    }
+    try {
+        return torch::empty(sizes, opts.device(device));
+    } catch (const std::exception&) {
+        return torch::empty(sizes, opts).to(device);
+    }
+}
+
 inline torch::Tensor make_output_tensor(
     const std::vector<int64_t>& sizes,
     torch::ScalarType dtype,
     const torch::Tensor& reference_tensor
 ) {
-    (void)reference_tensor;
-    return torch::zeros(sizes, torch::TensorOptions().dtype(dtype));
+    return _safe_zeros_on_device(sizes, dtype, reference_tensor.device());
 }
 
 inline torch::Tensor make_empty_tensor(
@@ -155,8 +186,7 @@ inline torch::Tensor make_empty_tensor(
     torch::ScalarType dtype,
     const torch::Tensor& reference_tensor
 ) {
-    (void)reference_tensor;
-    return torch::empty(sizes, torch::TensorOptions().dtype(dtype));
+    return _safe_empty_on_device(sizes, dtype, reference_tensor.device());
 }
 
 // Check if any tensor in a parameter pack is on MPS.
@@ -192,6 +222,7 @@ inline void dispatch_kernel(bool on_mps,
         auto* stream = at::mps::getCurrentMPSStream();
         at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
             @autoreleasepool {
+                stream->endKernelCoalescing();
                 id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
                 id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
                 encode(cmdBuf, enc);
@@ -221,6 +252,7 @@ inline void dispatch_batch(bool on_mps,
         auto* stream = at::mps::getCurrentMPSStream();
         at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
             @autoreleasepool {
+                stream->endKernelCoalescing();
                 id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
                 encode_batch(cmdBuf);
             }

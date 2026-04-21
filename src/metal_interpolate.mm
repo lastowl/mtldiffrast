@@ -47,6 +47,8 @@ std::tuple<torch::Tensor, torch::Tensor> interpolate(
     auto rast_ref = tensor_to_mtl_buffer(rast_c);
     auto out_ref = tensor_to_mtl_buffer(output);
 
+    bool on_mps = output.device().is_mps();
+
     if (enable_da && rast_db.defined()) {
         output_da = make_output_tensor({H, W, A, 2}, torch::kFloat32, attr);
         auto rast_db_c = rast_db.contiguous().to(torch::kFloat32);
@@ -54,36 +56,34 @@ std::tuple<torch::Tensor, torch::Tensor> interpolate(
         auto da_ref = tensor_to_mtl_buffer(output_da);
 
         auto pso = mtl_get_pipeline("interpolate_fwd_da_kernel");
-        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
-        [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
-        [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
-        [enc setBuffer:db_ref.buffer   offset:db_ref.offset   atIndex:3];
-        [enc setBytes:&params length:sizeof(params) atIndex:4];
-        [enc setBuffer:out_ref.buffer  offset:out_ref.offset  atIndex:5];
-        [enc setBuffer:da_ref.buffer   offset:da_ref.offset   atIndex:6];
-        [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [enc endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+            (void)cmdBuf;
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
+            [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
+            [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
+            [enc setBuffer:db_ref.buffer   offset:db_ref.offset   atIndex:3];
+            [enc setBytes:&params length:sizeof(params) atIndex:4];
+            [enc setBuffer:out_ref.buffer  offset:out_ref.offset  atIndex:5];
+            [enc setBuffer:da_ref.buffer   offset:da_ref.offset   atIndex:6];
+            [enc dispatchThreads:MTLSizeMake(W, H, 1)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        });
 
         output_da = output_da.view({H, W, 2 * A});
     } else {
         auto pso = mtl_get_pipeline("interpolate_fwd_kernel");
-        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:pso];
-        [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
-        [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
-        [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
-        [enc setBytes:&params length:sizeof(params) atIndex:3];
-        [enc setBuffer:out_ref.buffer  offset:out_ref.offset  atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-        [enc endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+            (void)cmdBuf;
+            [enc setComputePipelineState:pso];
+            [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
+            [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
+            [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
+            [enc setBytes:&params length:sizeof(params) atIndex:3];
+            [enc setBuffer:out_ref.buffer  offset:out_ref.offset  atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(W, H, 1)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        });
 
         output_da = torch::Tensor();
     }
@@ -124,21 +124,21 @@ std::tuple<torch::Tensor, torch::Tensor> interpolate_grad(
     auto ga_ref = tensor_to_mtl_buffer(grad_attr);
     auto gr_ref = tensor_to_mtl_buffer(grad_rast);
 
+    bool on_mps = grad_attr.device().is_mps();
     auto pso = mtl_get_pipeline("interpolate_grad_kernel");
-    id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
-    [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
-    [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
-    [enc setBuffer:dy_ref.buffer   offset:dy_ref.offset   atIndex:3];
-    [enc setBuffer:ga_ref.buffer   offset:ga_ref.offset   atIndex:4];
-    [enc setBuffer:gr_ref.buffer   offset:gr_ref.offset   atIndex:5];
-    [enc setBytes:&params length:sizeof(params) atIndex:6];
-    [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+        (void)cmdBuf;
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
+        [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
+        [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
+        [enc setBuffer:dy_ref.buffer   offset:dy_ref.offset   atIndex:3];
+        [enc setBuffer:ga_ref.buffer   offset:ga_ref.offset   atIndex:4];
+        [enc setBuffer:gr_ref.buffer   offset:gr_ref.offset   atIndex:5];
+        [enc setBytes:&params length:sizeof(params) atIndex:6];
+        [enc dispatchThreads:MTLSizeMake(W, H, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    });
 
     return {grad_attr, grad_rast};
 }
@@ -183,24 +183,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> interpolate_grad_da(
     auto gr_ref = tensor_to_mtl_buffer(grad_rast);
     auto grdb_ref = tensor_to_mtl_buffer(grad_rast_db);
 
+    bool on_mps = grad_attr.device().is_mps();
     auto pso = mtl_get_pipeline("interpolate_grad_da_kernel");
-    id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-    [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
-    [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
-    [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
-    [enc setBuffer:db_ref.buffer   offset:db_ref.offset   atIndex:3];
-    [enc setBuffer:dy_ref.buffer   offset:dy_ref.offset   atIndex:4];
-    [enc setBuffer:dda_ref.buffer  offset:dda_ref.offset  atIndex:5];
-    [enc setBuffer:ga_ref.buffer   offset:ga_ref.offset   atIndex:6];
-    [enc setBuffer:gr_ref.buffer   offset:gr_ref.offset   atIndex:7];
-    [enc setBuffer:grdb_ref.buffer offset:grdb_ref.offset atIndex:8];
-    [enc setBytes:&params length:sizeof(params) atIndex:9];
-    [enc dispatchThreads:MTLSizeMake(W, H, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-    [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+    dispatch_kernel(on_mps, ^(id<MTLCommandBuffer> cmdBuf, id<MTLComputeCommandEncoder> enc) {
+        (void)cmdBuf;
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:tri_ref.buffer  offset:tri_ref.offset  atIndex:0];
+        [enc setBuffer:attr_ref.buffer offset:attr_ref.offset atIndex:1];
+        [enc setBuffer:rast_ref.buffer offset:rast_ref.offset atIndex:2];
+        [enc setBuffer:db_ref.buffer   offset:db_ref.offset   atIndex:3];
+        [enc setBuffer:dy_ref.buffer   offset:dy_ref.offset   atIndex:4];
+        [enc setBuffer:dda_ref.buffer  offset:dda_ref.offset  atIndex:5];
+        [enc setBuffer:ga_ref.buffer   offset:ga_ref.offset   atIndex:6];
+        [enc setBuffer:gr_ref.buffer   offset:gr_ref.offset   atIndex:7];
+        [enc setBuffer:grdb_ref.buffer offset:grdb_ref.offset atIndex:8];
+        [enc setBytes:&params length:sizeof(params) atIndex:9];
+        [enc dispatchThreads:MTLSizeMake(W, H, 1)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    });
 
     return {grad_attr, grad_rast, grad_rast_db};
 }
