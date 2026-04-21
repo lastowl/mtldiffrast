@@ -1,9 +1,15 @@
 // Shared Metal device/queue/library + MPS zero-copy buffer binding.
 // Consolidates singletons used across rasterize, interpolate, texture, antialias.
 //
-// On Apple Silicon, MPS and CPU tensors share unified memory.
-// data_ptr() returns a valid address for both — we bind it directly via
-// newBufferWithBytesNoCopy (zero copies).
+// MPS tensors own MTLBuffers allocated by PyTorch's MPS allocator. We wrap
+// them zero-copy via at::native::mps::getMTLBufferStorage, and encode our
+// kernel into PyTorch's active MPSStream so work sequences correctly with
+// surrounding torch.mps ops — no per-call CPU sync, no CPU round-trip.
+//
+// CPU tensors wrap via newBufferWithBytesNoCopy against the tensor's data_ptr
+// (Apple Silicon unified memory makes this a metadata-only operation), and
+// fall back to commit + waitUntilCompleted since the output storage must be
+// valid on return.
 #pragma once
 
 #import <Metal/Metal.h>
@@ -14,7 +20,16 @@
 // Public MPS API for synchronization
 #if __has_include(<torch/mps.h>)
 #include <torch/mps.h>
+#import <ATen/mps/MPSStream.h>
 #define MTLDIFFRAST_HAS_MPS 1
+
+// Forward-declared — defined in ATen/native/mps/OperationUtils.h but that
+// header pulls in non-ARC MPS graph headers.
+namespace at { namespace native { namespace mps {
+static inline id<MTLBuffer> getMTLBufferStorage(const at::TensorBase& tensor) {
+    return __builtin_bit_cast(id<MTLBuffer>, tensor.storage().data());
+}
+}}}
 #else
 #define MTLDIFFRAST_HAS_MPS 0
 #endif
@@ -94,32 +109,44 @@ struct MtlBufferRef {
 
 inline MtlBufferRef tensor_to_mtl_buffer(const torch::Tensor& t) {
     TORCH_CHECK(t.is_contiguous(), "[mtldiffrast] tensor must be contiguous for Metal binding");
+    TORCH_CHECK(t.numel() > 0, "[mtldiffrast] cannot create Metal buffer from empty tensor");
 
-    // MPS tensors must be moved to CPU first — MPS data_ptr() points into
-    // MPS's own MTLBuffer allocator and cannot be re-wrapped. On Apple Silicon
-    // unified memory this is a metadata-only operation (same physical pages).
-    auto tc = tensor_is_mps(t) ? t.cpu() : t;
+#if MTLDIFFRAST_HAS_MPS
+    if (tensor_is_mps(t)) {
+        id<MTLBuffer> buf = at::native::mps::getMTLBufferStorage(t);
+        TORCH_CHECK(buf != nil, "[mtldiffrast] Failed to get MPS MTLBuffer");
+        NSUInteger offset = (NSUInteger)t.storage_offset() * t.element_size();
+        return {buf, offset};
+    }
+#endif
 
-    size_t nbytes = tc.nbytes();
-    TORCH_CHECK(nbytes > 0, "[mtldiffrast] cannot create Metal buffer from empty tensor");
-
-    // CPU tensors: wrap existing memory directly — zero copies on unified memory.
-    id<MTLBuffer> buf = [mtl_get_device() newBufferWithBytesNoCopy:tc.data_ptr()
-                                                             length:nbytes
+    // CPU tensors: wrap existing memory directly (unified memory → zero copy).
+    id<MTLBuffer> buf = [mtl_get_device() newBufferWithBytesNoCopy:t.data_ptr()
+                                                             length:t.nbytes()
                                                             options:MTLResourceStorageModeShared
                                                         deallocator:nil];
     TORCH_CHECK(buf != nil, "[mtldiffrast] Failed to create Metal buffer from tensor");
     return {buf, 0};
 }
 
-// Create output tensors on CPU — Metal kernels write to CPU memory via
-// newBufferWithBytesNoCopy. On Apple Silicon unified memory, CPU tensors
-// are GPU-accessible.
+// Output tensors stay on CPU — the render-pipeline rasterize path uses
+// [MTLTexture getBytes:out.data_ptr()] which requires CPU-mapped memory,
+// and the compute paths use newBufferWithBytesNoCopy against the tensor's
+// data_ptr which also requires CPU backing. Proper MPS-output support
+// needs a blit-encoder pass to copy private-storage render targets into
+// an MTLBuffer + matching MPS allocation for the compute paths; tracked
+// in FOLLOWUPS.md. For now the caller (Python side) can .to('mps') the
+// result — the regression from zero-copy is just one device transfer,
+// vs the input-side leak which was PER element of a call.
+//
+// reference_tensor is kept in the signature so callers can later opt in
+// to device-aware allocation without a source churn.
 inline torch::Tensor make_output_tensor(
     const std::vector<int64_t>& sizes,
     torch::ScalarType dtype,
     const torch::Tensor& reference_tensor
 ) {
+    (void)reference_tensor;
     return torch::zeros(sizes, torch::TensorOptions().dtype(dtype));
 }
 
@@ -128,6 +155,7 @@ inline torch::Tensor make_empty_tensor(
     torch::ScalarType dtype,
     const torch::Tensor& reference_tensor
 ) {
+    (void)reference_tensor;
     return torch::empty(sizes, torch::TensorOptions().dtype(dtype));
 }
 
@@ -145,6 +173,65 @@ inline void mps_sync() {
 #if MTLDIFFRAST_HAS_MPS
     torch::mps::commit();
 #endif
+}
+
+// Dispatch helper that picks the right execution mode for the tensor's
+// device. On MPS, encodes into PyTorch's active MPSStream command buffer so
+// our kernel orders correctly with surrounding torch.mps ops without a CPU
+// sync per call — PyTorch commits the buffer at its next sync point. On CPU,
+// commits + waits synchronously since the output storage must be valid on
+// return.
+//
+// The callback receives a ready-to-encode MTLComputeCommandEncoder; call it
+// with your PSO + buffer bindings + dispatchThreads/dispatchThreadgroups.
+inline void dispatch_kernel(bool on_mps,
+                            void (^encode)(id<MTLCommandBuffer>,
+                                           id<MTLComputeCommandEncoder>)) {
+#if MTLDIFFRAST_HAS_MPS
+    if (on_mps) {
+        auto* stream = at::mps::getCurrentMPSStream();
+        at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
+                id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+                encode(cmdBuf, enc);
+                [enc endEncoding];
+            }
+        });
+        return;
+    }
+#endif
+    id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+    encode(cmdBuf, enc);
+    [enc endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+}
+
+// Batched variant for kernels that need to issue multiple dispatches within
+// the same command buffer (e.g. mipmap builder). The callback receives the
+// command buffer — create encoders yourself, one per dispatch, end each
+// before creating the next. On MPS, one encode into the stream; on CPU, one
+// commit+wait at the end.
+inline void dispatch_batch(bool on_mps,
+                           void (^encode_batch)(id<MTLCommandBuffer>)) {
+#if MTLDIFFRAST_HAS_MPS
+    if (on_mps) {
+        auto* stream = at::mps::getCurrentMPSStream();
+        at::mps::dispatch_sync_with_rethrow(stream->queue(), ^() {
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmdBuf = stream->commandBuffer();
+                encode_batch(cmdBuf);
+            }
+        });
+        return;
+    }
+#endif
+    id<MTLCommandBuffer> cmdBuf = [mtl_get_queue() commandBuffer];
+    encode_batch(cmdBuf);
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
 }
 
 } // namespace mtldiffrast
