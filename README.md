@@ -40,3 +40,13 @@ aa_out = dr.antialias(color, rast, pos, tri)
 ## License
 
 MIT License
+
+---
+
+## Apple-Silicon follow-ups
+
+Cross-repo follow-up work (deferred mtlgemm perf items, fp16/bf16 shader
+specializations, universal tiled sparse attention, etc.) is tracked in
+`/Users/gusto/work/ai/FOLLOWUPS.md` alongside the four `mtl*` repos. If
+you touch any of them, update that file — it's the single source of truth
+for what's intentionally deferred vs what's still broken.
